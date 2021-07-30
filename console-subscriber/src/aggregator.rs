@@ -1,6 +1,6 @@
 use crate::WatchRequest;
 
-use super::{Event, WakeOp, Watch, WatchKind};
+use super::{Command, Event, WakeOp, Watch};
 use console_api as proto;
 use tokio::sync::{mpsc, Notify};
 
@@ -27,7 +27,7 @@ pub(crate) struct Aggregator {
     events: mpsc::Receiver<Event>,
 
     /// New incoming RPCs.
-    rpcs: mpsc::Receiver<WatchKind>,
+    rpcs: mpsc::Receiver<Command>,
 
     /// The interval at which new data updates are pushed to clients.
     publish_interval: Duration,
@@ -59,12 +59,21 @@ pub(crate) struct Aggregator {
 
     /// Map of task IDs to task stats.
     stats: TaskData<Stats>,
+
+    /// The time "state" of the aggregator, such as paused or live.
+    temporality: Temporality,
 }
 
 #[derive(Debug)]
 pub(crate) struct Flush {
     pub(crate) should_flush: Notify,
     pub(crate) triggered: AtomicBool,
+}
+
+#[derive(Debug)]
+enum Temporality {
+    Live,
+    Paused,
 }
 
 struct Stats {
@@ -122,7 +131,7 @@ impl Default for Stats {
 impl Aggregator {
     pub(crate) fn new(
         events: mpsc::Receiver<Event>,
-        rpcs: mpsc::Receiver<WatchKind>,
+        rpcs: mpsc::Receiver<Command>,
         builder: &crate::Builder,
     ) -> Self {
         Self {
@@ -142,6 +151,7 @@ impl Aggregator {
                 data: HashMap::<span::Id, (Task, bool)>::new(),
             },
             stats: TaskData::default(),
+            temporality: Temporality::Live,
         }
     }
 
@@ -155,7 +165,10 @@ impl Aggregator {
             let should_send = tokio::select! {
                 // if the flush interval elapses, flush data to the client
                 _ = publish.tick() => {
-                    true
+                    match self.temporality {
+                        Temporality::Live => true,
+                        Temporality::Paused => false,
+                    }
                 }
 
                 // triggered when the event buffer is approaching capacity
@@ -165,16 +178,22 @@ impl Aggregator {
                     false
                 }
 
-                // a new client has started watching!
-                subscription = self.rpcs.recv() => {
-                    match subscription {
-                        Some(WatchKind::Tasks(subscription)) => {
+                // a new command from a client
+                cmd = self.rpcs.recv() => {
+                    match cmd {
+                        Some(Command::WatchTasks(subscription)) => {
                             self.add_task_subscription(subscription);
                         },
-                        Some(WatchKind::TaskDetail(watch_request)) => {
+                        Some(Command::WatchTaskDetail(watch_request)) => {
                             self.add_task_detail_subscription(watch_request);
                         },
-                        _ => {
+                        Some(Command::Pause) => {
+                            self.temporality = Temporality::Paused;
+                        }
+                        Some(Command::Resume) => {
+                            self.temporality = Temporality::Live;
+                        }
+                        None => {
                             tracing::debug!("rpc channel closed, terminating");
                             return;
                         }

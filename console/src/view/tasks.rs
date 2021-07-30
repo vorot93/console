@@ -137,7 +137,9 @@ impl List {
             bold("i"),
             text::Span::raw(" = invert sort (highest/lowest), "),
             bold("q"),
-            text::Span::raw(" = quit"),
+            text::Span::raw(" = quit, "),
+            bold("space"),
+            text::Span::raw(" = pause"),
         ]);
 
         let header = Row::new(Self::HEADER.iter().enumerate().map(|(idx, &value)| {

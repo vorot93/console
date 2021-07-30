@@ -6,7 +6,7 @@ use futures::stream::StreamExt;
 use tokio::sync::{mpsc, watch};
 use tui::{
     layout::{Constraint, Direction, Layout},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Span, Spans},
     widgets::{Block, Paragraph, Wrap},
 };
@@ -51,6 +51,17 @@ async fn main() -> color_eyre::Result<()> {
                 if input::should_quit(&input) {
                     return Ok(());
                 }
+
+                if input::is_space(&input) {
+                    if tasks.is_paused() {
+                        conn.resume().await;
+                        tasks.resume();
+                    } else {
+                        conn.pause().await;
+                        tasks.pause();
+                    }
+                }
+
                 let update_kind = view.update_input(input, &tasks);
                 // Using the result of update_input to manage the details watcher task
                 let _ = update_tx.send(update_kind);
@@ -83,7 +94,15 @@ async fn main() -> color_eyre::Result<()> {
                 .constraints([Constraint::Length(2), Constraint::Percentage(95)].as_ref())
                 .split(f.size());
 
-            let header_block = Block::default().title(conn.render());
+            let mut header_title = conn.render();
+
+            if tasks.is_paused() {
+                header_title
+                    .0
+                    .push(Span::styled(" PAUSED", Style::default().fg(Color::Red)));
+            }
+
+            let header_block = Block::default().title(header_title);
 
             let text = vec![Spans::from(vec![
                 Span::styled(
