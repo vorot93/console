@@ -1,34 +1,76 @@
 [package]
 name = "console-subscriber"
-version = "0.1.0"
-edition = "2018"
+version = "0.4.1"
 license = "MIT"
+edition = "2021"
+rust-version = "1.74.0"
+authors = ["Eliza Weisman <eliza@buoyant.io>", "Tokio Contributors <team@tokio.rs>",]
+readme = "README.md"
+repository = "https://github.com/tokio-rs/console/"
+homepage = "https://github.com/tokio-rs/console/blob/main/console-subscriber"
+description = """
+A `tracing-subscriber::Layer` for collecting Tokio console telemetry.
+"""
+categories = [
+    "development-tools::debugging",
+    "development-tools::profiling",
+    "asynchronous",
+]
+keywords = [
+    "tracing",
+    "tracing-subscriber",
+    "tokio-console",
+    "debugging",
+    "async",
+]
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [features]
-default = []
-parking_lot = ["parking_lot_crate", "tracing-subscriber/parking_lot"]
+default = ["env-filter"]
+parking_lot = ["dep:parking_lot", "tracing-subscriber/parking_lot"]
+env-filter = ["tracing-subscriber/env-filter"]
+grpc-web = ["dep:tonic-web"]
 
 [dependencies]
-
-tokio = { version = "^1.13", features = ["sync", "time", "macros", "tracing"] }
-tokio-stream = "0.1"
-thread_local = "1.1.3"
-console-api = { path = "../console-api", features = ["transport"] }
-tonic = { version = "0.6", features = ["transport"] }
-tracing-core = "0.1.18"
-tracing = "0.1.26"
-tracing-subscriber = { version = "0.3.0", default-features = false, features = ["fmt", "registry"] }
-futures = { version = "0.3", default-features = false }
-hdrhistogram = { version = "7.3.0", default-features = false, features = ["serialization"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-# The parking_lot dependency is renamed, because we want our `parking_lot`
-# feature to also enable `tracing-subscriber`'s parking_lot feature flag.
-parking_lot_crate = { package = "parking_lot", version = "0.11", optional = true }
+crossbeam-utils = "0.8.7"
+tokio = { version = "1.34", features = ["sync", "time", "macros", "tracing"] }
+tokio-stream = { version = "0.1.16", features = ["net"] }
+thread_local = "1.1.4"
+console-api = { version = "0.8.0", path = "../console-api", features = ["transport"] }
+tonic = { version = "0.12.3", features = ["transport"] }
+tracing-core = "0.1.30"
+tracing = "0.1.35"
+tracing-subscriber = { version = "0.3.17", default-features = false, features = ["fmt", "registry"] }
+futures-task = { version = "0.3.31", default-features = false }
+hdrhistogram = { version = "7.4.0", default-features = false, features = ["serialization"] }
+parking_lot = { version = "0.12.1", optional = true }
 humantime = "2.1.0"
+prost = "0.13.3"
+prost-types = "0.13.3"
+hyper-util = { version = "0.1.6", features = ["tokio"] }
+
+# Required for recording:
+serde = { version = "1.0.145", features = ["derive"] }
+serde_json = "1"
+crossbeam-channel = "0.5"
+
+# Only for the web feature:
+tonic-web = { version = "0.12", optional = true }
 
 [dev-dependencies]
-
-tokio = { version = "^1.7", features = ["full", "rt-multi-thread"] }
+tokio = { version = "1.34", features = ["full", "rt-multi-thread"] }
+tower = { version = "0.4.12", default-features = false }
 futures = "0.3"
+http = "1.1"
+tower-http = { version = "0.5", features = ["cors"] }
+
+[lints.rust.unexpected_cfgs]
+level = "warn"
+check-cfg = [ 'cfg(tokio_unstable)', 'cfg(console_without_tokio_unstable)' ]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[[example]]
+name = "grpc_web"
+required-features = ["grpc-web"]

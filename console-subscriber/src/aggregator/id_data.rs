@@ -1,14 +1,13 @@
-use super::{shrink::ShrinkMap, DroppedAt, Id, Ids, ToProto};
-use std::collections::{HashMap, HashSet};
-use std::ops::{Deref, DerefMut};
-use std::time::{Duration, SystemTime};
+use super::{shrink::ShrinkMap, Id, ToProto};
+use crate::stats::{DroppedAt, TimeAnchor, Unsent};
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 pub(crate) struct IdData<T> {
-    data: ShrinkMap<Id, (T, bool)>,
+    data: ShrinkMap<Id, T>,
 }
 
-pub(crate) struct Updating<'a, T>(&'a mut (T, bool));
-
+#[derive(Copy, Clone, Eq, PartialEq)]
 pub(crate) enum Include {
     All,
     UpdatedOnly,
@@ -19,31 +18,19 @@ pub(crate) enum Include {
 impl<T> Default for IdData<T> {
     fn default() -> Self {
         IdData {
-            data: ShrinkMap::<Id, (T, bool)>::new(),
+            data: ShrinkMap::<Id, T>::new(),
         }
     }
 }
 
-impl<T> IdData<T> {
-    pub(crate) fn update_or_default(&mut self, id: Id) -> Updating<'_, T>
-    where
-        T: Default,
-    {
-        Updating(self.data.entry(id).or_default())
-    }
-
-    pub(crate) fn update(&mut self, id: &Id) -> Option<Updating<'_, T>> {
-        self.data.get_mut(id).map(Updating)
-    }
-
+impl<T: Unsent> IdData<T> {
     pub(crate) fn insert(&mut self, id: Id, data: T) {
-        self.data.insert(id, (data, true));
+        self.data.insert(id, data);
     }
 
     pub(crate) fn since_last_update(&mut self) -> impl Iterator<Item = (&Id, &mut T)> {
-        self.data.iter_mut().filter_map(|(id, (data, dirty))| {
-            if *dirty {
-                *dirty = false;
+        self.data.iter_mut().filter_map(|(id, data)| {
+            if data.take_unsent() {
                 Some((id, data))
             } else {
                 None
@@ -52,33 +39,56 @@ impl<T> IdData<T> {
     }
 
     pub(crate) fn all(&self) -> impl Iterator<Item = (&Id, &T)> {
-        self.data.iter().map(|(id, (data, _))| (id, data))
+        self.data.iter()
     }
 
     pub(crate) fn get(&self, id: &Id) -> Option<&T> {
-        self.data.get(id).map(|(data, _)| data)
+        self.data.get(id)
     }
 
-    pub(crate) fn as_proto(&mut self, include: Include) -> HashMap<u64, T::Output>
+    pub(crate) fn as_proto_list(
+        &mut self,
+        include: Include,
+        base_time: &TimeAnchor,
+    ) -> Vec<T::Output>
     where
         T: ToProto,
     {
         match include {
             Include::UpdatedOnly => self
                 .since_last_update()
-                .map(|(id, d)| (*id, d.to_proto()))
+                .map(|(_, d)| d.to_proto(base_time))
                 .collect(),
-            Include::All => self.all().map(|(id, d)| (*id, d.to_proto())).collect(),
+            Include::All => self.all().map(|(_, d)| d.to_proto(base_time)).collect(),
         }
     }
 
-    pub(crate) fn drop_closed<R: DroppedAt>(
+    pub(crate) fn as_proto(
+        &mut self,
+        include: Include,
+        base_time: &TimeAnchor,
+    ) -> HashMap<u64, T::Output>
+    where
+        T: ToProto,
+    {
+        match include {
+            Include::UpdatedOnly => self
+                .since_last_update()
+                .map(|(id, d)| (id.into_u64(), d.to_proto(base_time)))
+                .collect(),
+            Include::All => self
+                .all()
+                .map(|(id, d)| (id.into_u64(), d.to_proto(base_time)))
+                .collect(),
+        }
+    }
+
+    pub(crate) fn drop_closed<R: DroppedAt + Unsent>(
         &mut self,
         stats: &mut IdData<R>,
-        now: SystemTime,
+        now: Instant,
         retention: Duration,
         has_watchers: bool,
-        ids: &mut Ids,
     ) {
         let _span = tracing::debug_span!(
             "drop_closed",
@@ -90,26 +100,22 @@ impl<T> IdData<T> {
         // drop closed entities
         tracing::trace!(?retention, has_watchers, "dropping closed");
 
-        let mut dropped_ids = HashSet::new();
-        stats.data.retain_and_shrink(|id, (stats, dirty)| {
+        stats.data.retain_and_shrink(|id, stats| {
             if let Some(dropped_at) = stats.dropped_at() {
-                let dropped_for = now.duration_since(dropped_at).unwrap_or_default();
-                let should_drop =
+                let dropped_for = now.checked_duration_since(dropped_at).unwrap_or_default();
+                let dirty = stats.is_unsent();
+                let should_retain =
                         // if there are any clients watching, retain all dirty tasks regardless of age
-                        (*dirty && has_watchers)
-                        || dropped_for > retention;
+                        (dirty && has_watchers)
+                        || dropped_for <= retention;
                 tracing::trace!(
                     stats.id = ?id,
                     stats.dropped_at = ?dropped_at,
                     stats.dropped_for = ?dropped_for,
-                    stats.dirty = *dirty,
-                    should_drop,
+                    stats.dirty = dirty,
+                    should_retain,
                 );
-
-                if should_drop {
-                    dropped_ids.insert(*id);
-                }
-                return !should_drop;
+                return should_retain;
             }
 
             true
@@ -117,34 +123,6 @@ impl<T> IdData<T> {
 
         // drop closed entities which no longer have stats.
         self.data
-            .retain_and_shrink(|id, (_, _)| stats.data.contains_key(id));
-
-        if !dropped_ids.is_empty() {
-            // drop closed entities which no longer have stats.
-            self.data
-                .retain_and_shrink(|id, (_, _)| stats.data.contains_key(id));
-            ids.remove_all(&dropped_ids);
-        }
-    }
-}
-
-// === impl Updating ===
-
-impl<'a, T> Deref for Updating<'a, T> {
-    type Target = T;
-    fn deref(&self) -> &Self::Target {
-        &self.0 .0
-    }
-}
-
-impl<'a, T> DerefMut for Updating<'a, T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0 .0
-    }
-}
-
-impl<'a, T> Drop for Updating<'a, T> {
-    fn drop(&mut self) {
-        self.0 .1 = true;
+            .retain_and_shrink(|id, _| stats.data.contains_key(id));
     }
 }

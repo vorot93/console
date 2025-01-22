@@ -1,7 +1,12 @@
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
-tonic::include_proto!("rs.tokio.console.common");
+pub use generated::*;
+
+mod generated {
+    #![allow(warnings)]
+    include!("generated/rs.tokio.console.common.rs");
+}
 
 impl From<tracing_core::Level> for metadata::Level {
     fn from(level: tracing_core::Level) -> Self {
@@ -17,9 +22,20 @@ impl From<tracing_core::Level> for metadata::Level {
 
 impl From<tracing_core::metadata::Kind> for metadata::Kind {
     fn from(kind: tracing_core::metadata::Kind) -> Self {
-        match kind {
-            tracing_core::metadata::Kind::SPAN => metadata::Kind::Span,
-            tracing_core::metadata::Kind::EVENT => metadata::Kind::Event,
+        // /!\ Note that this is intentionally *not* implemented using match.
+        // The `metadata::Kind` struct in `tracing_core` was written not
+        // intending to allow exhaustive matches, but accidentally did.
+        //
+        // Therefore, we shouldn't be able to write a match against both
+        // variants without a wildcard arm. However, on versions of
+        // `tracing_core` where the type was exhaustively matchable, a wildcard
+        // arm will result in a warning. Thus we must write this rather
+        // tortured-looking `if` statement to get non-exhaustive matching
+        // behavior.
+        if kind == tracing_core::metadata::Kind::SPAN {
+            metadata::Kind::Span
+        } else {
+            metadata::Kind::Event
         }
     }
 }
@@ -194,7 +210,7 @@ impl From<&dyn std::fmt::Debug> for field::Value {
 // or vice versa. However, this is unavoidable here, because `prost` generates
 // a struct with `#[derive(PartialEq)]`, but we cannot add`#[derive(Hash)]` to the
 // generated code.
-#[allow(clippy::derive_hash_xor_eq)]
+#[allow(clippy::derived_hash_with_manual_eq)]
 impl Hash for field::Name {
     fn hash<H: Hasher>(&self, state: &mut H) {
         match self {
@@ -220,4 +236,8 @@ impl From<Id> for u64 {
     }
 }
 
-impl Copy for Id {}
+impl From<tracing_core::span::Id> for Id {
+    fn from(id: tracing_core::span::Id) -> Self {
+        Id { id: id.into_u64() }
+    }
+}

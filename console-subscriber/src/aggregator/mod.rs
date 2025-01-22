@@ -1,35 +1,38 @@
-use super::{AttributeUpdate, AttributeUpdateOp, Command, Event, WakeOp, Watch};
-use crate::{record::Recorder, WatchRequest};
-use console_api as proto;
-use proto::resources::resource;
-use proto::resources::stats::Attribute;
-use tokio::sync::{mpsc, Notify};
-
-use futures::FutureExt;
 use std::{
-    collections::{hash_map::Entry, HashMap, HashSet},
-    convert::TryInto,
     sync::{
         atomic::{AtomicBool, Ordering::*},
         Arc,
     },
-    time::{Duration, SystemTime},
-};
-use tracing_core::{span, Metadata};
-
-use hdrhistogram::{
-    serialization::{Serializer, V2SerializeError, V2Serializer},
-    Histogram,
+    time::{Duration, Instant},
 };
 
-pub type Id = u64;
+use console_api as proto;
+use prost::Message;
+use proto::resources::resource;
+use tokio::sync::{mpsc, Notify};
+use tracing_core::{span::Id, Metadata};
+
+use super::{Command, Event, Shared, Watch};
+use crate::{
+    stats::{self, Unsent},
+    ToProto, WatchRequest,
+};
 
 mod id_data;
 mod shrink;
 use self::id_data::{IdData, Include};
 use self::shrink::{ShrinkMap, ShrinkVec};
 
-pub(crate) struct Aggregator {
+/// Should match tonic's (private) codec::DEFAULT_MAX_RECV_MESSAGE_SIZE
+const MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
+
+/// Aggregates instrumentation traces and prepares state for the instrument
+/// server.
+///
+/// The `Aggregator` is responsible for receiving and organizing the
+/// instrumentated events and preparing the data to be served to a instrument
+/// client.
+pub struct Aggregator {
     /// Channel of incoming events emitted by `TaskLayer`s.
     events: mpsc::Receiver<Event>,
 
@@ -42,8 +45,12 @@ pub(crate) struct Aggregator {
     /// How long to keep task data after a task has completed.
     retention: Duration,
 
-    /// Triggers a flush when the event buffer is approaching capacity.
-    flush_capacity: Arc<Flush>,
+    /// Shared state, including a `Notify` that triggers a flush when the event
+    /// buffer is approaching capacity.
+    shared: Arc<Shared>,
+
+    /// Currently active RPCs streaming state events.
+    state_watchers: ShrinkVec<Watch<proto::instrument::State>>,
 
     /// Currently active RPCs streaming task events.
     watchers: ShrinkVec<Watch<proto::instrument::Update>>,
@@ -65,213 +72,67 @@ pub(crate) struct Aggregator {
     tasks: IdData<Task>,
 
     /// Map of task IDs to task stats.
-    task_stats: IdData<TaskStats>,
+    task_stats: IdData<Arc<stats::TaskStats>>,
 
     /// Map of resource IDs to resource static data.
     resources: IdData<Resource>,
 
     /// Map of resource IDs to resource stats.
-    resource_stats: IdData<ResourceStats>,
+    resource_stats: IdData<Arc<stats::ResourceStats>>,
 
     /// Map of AsyncOp IDs to AsyncOp static data.
     async_ops: IdData<AsyncOp>,
 
     /// Map of AsyncOp IDs to AsyncOp stats.
-    async_op_stats: IdData<AsyncOpStats>,
+    async_op_stats: IdData<Arc<stats::AsyncOpStats>>,
 
-    /// *All* PollOp events for AsyncOps on Resources.
-    ///
-    /// This is sent to new clients as part of the initial state.
-    // TODO: drop the poll ops for async ops that have been dropped
-    all_poll_ops: ShrinkVec<proto::resources::PollOp>,
-
-    /// *New* PollOp events that whave occurred since the last update
+    /// `PollOp `events that have occurred since the last update
     ///
     /// This is emptied on every state update.
-    new_poll_ops: Vec<proto::resources::PollOp>,
-
-    ids: Ids,
-
-    /// A sink to record all events to a file.
-    recorder: Option<Recorder>,
+    poll_ops: Vec<proto::resources::PollOp>,
 
     /// The time "state" of the aggregator, such as paused or live.
-    temporality: Temporality,
+    temporality: proto::instrument::Temporality,
+
+    /// Used to anchor monotonic timestamps to a base `SystemTime`, to produce a
+    /// timestamp that can be sent over the wire.
+    base_time: stats::TimeAnchor,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(crate) struct Flush {
     pub(crate) should_flush: Notify,
     triggered: AtomicBool,
 }
 
-// An entity (e.g Task, Resource) that at some point in
-// time can be dropped. This generally refers to spans that
-// have been closed indicating that a task, async op or a
-// resource is not in use anymore
-pub(crate) trait DroppedAt {
-    fn dropped_at(&self) -> Option<SystemTime>;
-}
-
-pub(crate) trait ToProto {
-    type Output;
-    fn to_proto(&self) -> Self::Output;
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct Ids {
-    /// A counter for the pretty task IDs.
-    next: Id,
-
-    /// A table that contains the span ID to pretty ID mappings.
-    id_mappings: ShrinkMap<span::Id, Id>,
-}
-
-#[derive(Debug)]
-enum Temporality {
-    Live,
-    Paused,
-}
-
-#[derive(Default)]
-struct PollStats {
-    /// The number of polls in progress
-    current_polls: u64,
-    /// The total number of polls
-    polls: u64,
-    first_poll: Option<SystemTime>,
-    last_poll_started: Option<SystemTime>,
-    last_poll_ended: Option<SystemTime>,
-    busy_time: Duration,
-}
-
 // Represent static data for resources
 struct Resource {
     id: Id,
+    is_dirty: AtomicBool,
+    parent_id: Option<Id>,
     metadata: &'static Metadata<'static>,
     concrete_type: String,
     kind: resource::Kind,
     location: Option<proto::Location>,
-}
-
-/// Represents a key for a `proto::field::Name`. Because the
-/// proto::field::Name might not be unique we also include the
-/// resource id in this key
-#[derive(Hash, PartialEq, Eq)]
-struct FieldKey {
-    resource_id: u64,
-    field_name: proto::field::Name,
-}
-
-#[derive(Default)]
-struct ResourceStats {
-    created_at: Option<SystemTime>,
-    dropped_at: Option<SystemTime>,
-    attributes: HashMap<FieldKey, Attribute>,
+    is_internal: bool,
 }
 
 /// Represents static data for tasks
 struct Task {
     id: Id,
+    is_dirty: AtomicBool,
     metadata: &'static Metadata<'static>,
     fields: Vec<proto::Field>,
     location: Option<proto::Location>,
 }
 
-struct TaskStats {
-    // task stats
-    created_at: Option<SystemTime>,
-    dropped_at: Option<SystemTime>,
-
-    // waker stats
-    wakes: u64,
-    waker_clones: u64,
-    waker_drops: u64,
-    self_wakes: u64,
-    last_wake: Option<SystemTime>,
-
-    poll_times_histogram: Histogram<u64>,
-    poll_stats: PollStats,
-}
-
 struct AsyncOp {
     id: Id,
+    is_dirty: AtomicBool,
+    parent_id: Option<Id>,
+    resource_id: Id,
     metadata: &'static Metadata<'static>,
     source: String,
-}
-
-#[derive(Default)]
-struct AsyncOpStats {
-    created_at: Option<SystemTime>,
-    dropped_at: Option<SystemTime>,
-    resource_id: Option<Id>,
-    task_id: Option<Id>,
-    poll_stats: PollStats,
-}
-
-impl DroppedAt for ResourceStats {
-    fn dropped_at(&self) -> Option<SystemTime> {
-        self.dropped_at
-    }
-}
-
-impl DroppedAt for TaskStats {
-    fn dropped_at(&self) -> Option<SystemTime> {
-        self.dropped_at
-    }
-}
-
-impl DroppedAt for AsyncOpStats {
-    fn dropped_at(&self) -> Option<SystemTime> {
-        self.dropped_at
-    }
-}
-
-impl PollStats {
-    fn update_on_span_enter(&mut self, timestamp: SystemTime) {
-        if self.current_polls == 0 {
-            self.last_poll_started = Some(timestamp);
-            if self.first_poll == None {
-                self.first_poll = Some(timestamp);
-            }
-            self.polls += 1;
-        }
-        self.current_polls += 1;
-    }
-
-    fn update_on_span_exit(&mut self, timestamp: SystemTime) {
-        self.current_polls -= 1;
-        if self.current_polls == 0 {
-            if let Some(last_poll_started) = self.last_poll_started {
-                let elapsed = timestamp.duration_since(last_poll_started).unwrap();
-                self.last_poll_ended = Some(timestamp);
-                self.busy_time += elapsed;
-            }
-        }
-    }
-
-    fn since_last_poll(&self, timestamp: SystemTime) -> Option<Duration> {
-        self.last_poll_started
-            .map(|lps| timestamp.duration_since(lps).unwrap())
-    }
-}
-
-impl Default for TaskStats {
-    fn default() -> Self {
-        TaskStats {
-            created_at: None,
-            dropped_at: None,
-            wakes: 0,
-            waker_clones: 0,
-            waker_drops: 0,
-            self_wakes: 0,
-            last_wake: None,
-            // significant figures should be in the [0-5] range and memory usage
-            // grows exponentially with higher a sigfig
-            poll_times_histogram: Histogram::<u64>::new(2).unwrap(),
-            poll_stats: PollStats::default(),
-        }
-    }
 }
 
 impl Aggregator {
@@ -279,18 +140,18 @@ impl Aggregator {
         events: mpsc::Receiver<Event>,
         rpcs: mpsc::Receiver<Command>,
         builder: &crate::Builder,
+        shared: Arc<crate::Shared>,
+        base_time: stats::TimeAnchor,
     ) -> Self {
         Self {
-            flush_capacity: Arc::new(Flush {
-                should_flush: Notify::new(),
-                triggered: AtomicBool::new(false),
-            }),
+            shared,
             rpcs,
             publish_interval: builder.publish_interval,
             retention: builder.retention,
             events,
             watchers: Default::default(),
             details_watchers: Default::default(),
+            state_watchers: Default::default(),
             all_metadata: Default::default(),
             new_metadata: Default::default(),
             tasks: IdData::default(),
@@ -299,35 +160,31 @@ impl Aggregator {
             resource_stats: IdData::default(),
             async_ops: IdData::default(),
             async_op_stats: IdData::default(),
-            all_poll_ops: Default::default(),
-            new_poll_ops: Default::default(),
-            ids: Ids::default(),
-            recorder: builder
-                .recording_path
-                .as_ref()
-                .map(|path| Recorder::new(path).expect("creating recorder")),
-            temporality: Temporality::Live,
+            poll_ops: Default::default(),
+            temporality: proto::instrument::Temporality::Live,
+            base_time,
         }
     }
 
-    pub(crate) fn flush(&self) -> &Arc<Flush> {
-        &self.flush_capacity
-    }
-
-    pub(crate) async fn run(mut self) {
+    /// Runs the aggregator.
+    ///
+    /// This method will start the aggregator loop and should run as long as
+    /// the instrument server is running. If the instrument server stops,
+    /// this future can be aborted.
+    pub async fn run(mut self) {
         let mut publish = tokio::time::interval(self.publish_interval);
         loop {
             let should_send = tokio::select! {
                 // if the flush interval elapses, flush data to the client
                 _ = publish.tick() => {
                     match self.temporality {
-                        Temporality::Live => true,
-                        Temporality::Paused => false,
+                        proto::instrument::Temporality::Live => true,
+                        proto::instrument::Temporality::Paused => false,
                     }
                 }
 
                 // triggered when the event buffer is approaching capacity
-                _ = self.flush_capacity.should_flush.notified() => {
+                _ = self.shared.flush.should_flush.notified() => {
                     tracing::debug!("approaching capacity; draining buffer");
                     false
                 }
@@ -341,11 +198,14 @@ impl Aggregator {
                         Some(Command::WatchTaskDetail(watch_request)) => {
                             self.add_task_detail_subscription(watch_request);
                         },
+                        Some(Command::WatchState(subscription)) => {
+                            self.add_state_subscription(subscription);
+                        }
                         Some(Command::Pause) => {
-                            self.temporality = Temporality::Paused;
+                            self.temporality = proto::instrument::Temporality::Paused;
                         }
                         Some(Command::Resume) => {
-                            self.temporality = Temporality::Live;
+                            self.temporality = proto::instrument::Temporality::Live;
                         }
                         None => {
                             tracing::debug!("rpc channel closed, terminating");
@@ -355,7 +215,6 @@ impl Aggregator {
 
                     false
                 }
-
             };
 
             // drain and aggregate buffered events.
@@ -367,13 +226,11 @@ impl Aggregator {
             // to be woken when the flush interval has elapsed, or when the
             // channel is almost full.
             let mut drained = false;
-            while let Some(event) = self.events.recv().now_or_never() {
+            let mut counts = EventCounts::new();
+            while let Some(event) = recv_now_or_never(&mut self.events) {
                 match event {
                     Some(event) => {
-                        // always be recording...
-                        if let Some(ref recorder) = self.recorder {
-                            recorder.record(&event);
-                        }
+                        counts.update(&event);
                         self.update_state(event);
                         drained = true;
                     }
@@ -385,6 +242,19 @@ impl Aggregator {
                     }
                 };
             }
+            tracing::debug!(
+                async_resource_ops = counts.async_resource_op,
+                metadatas = counts.metadata,
+                poll_ops = counts.poll_op,
+                resources = counts.resource,
+                spawns = counts.spawn,
+                total = counts.total(),
+                "event channel drain loop",
+            );
+
+            if !self.state_watchers.is_empty() {
+                self.publish_state();
+            }
 
             // flush data to clients, if there are any currently subscribed
             // watchers and we should send a new update.
@@ -393,7 +263,7 @@ impl Aggregator {
             }
             self.cleanup_closed();
             if drained {
-                self.flush_capacity.has_flushed();
+                self.shared.flush.has_flushed();
             }
         }
     }
@@ -401,70 +271,97 @@ impl Aggregator {
     fn cleanup_closed(&mut self) {
         // drop all closed have that has completed *and* whose final data has already
         // been sent off.
-        let now = SystemTime::now();
+        let now = Instant::now();
         let has_watchers = !self.watchers.is_empty();
-        self.tasks.drop_closed(
-            &mut self.task_stats,
-            now,
-            self.retention,
-            has_watchers,
-            &mut self.ids,
-        );
-        self.resources.drop_closed(
-            &mut self.resource_stats,
-            now,
-            self.retention,
-            has_watchers,
-            &mut self.ids,
-        );
-        self.async_ops.drop_closed(
-            &mut self.async_op_stats,
-            now,
-            self.retention,
-            has_watchers,
-            &mut self.ids,
-        );
+        self.tasks
+            .drop_closed(&mut self.task_stats, now, self.retention, has_watchers);
+        self.resources
+            .drop_closed(&mut self.resource_stats, now, self.retention, has_watchers);
+        self.async_ops
+            .drop_closed(&mut self.async_op_stats, now, self.retention, has_watchers);
+        if !has_watchers {
+            self.poll_ops.clear();
+        }
     }
 
     /// Add the task subscription to the watchers after sending the first update
     fn add_instrument_subscription(&mut self, subscription: Watch<proto::instrument::Update>) {
         tracing::debug!("new instrument subscription");
-        let now = SystemTime::now();
-        // Send the initial state --- if this fails, the subscription is already dead
-        let update = &proto::instrument::Update {
-            task_update: Some(proto::tasks::TaskUpdate {
-                new_tasks: self
-                    .tasks
-                    .all()
-                    .map(|(_, value)| value.to_proto())
-                    .collect(),
-                stats_update: self.task_stats.as_proto(Include::All),
-            }),
-            resource_update: Some(proto::resources::ResourceUpdate {
-                new_resources: self
-                    .resources
-                    .all()
-                    .map(|(_, value)| value.to_proto())
-                    .collect(),
-                stats_update: self.resource_stats.as_proto(Include::All),
-                new_poll_ops: (*self.all_poll_ops).clone(),
-            }),
-            async_op_update: Some(proto::async_ops::AsyncOpUpdate {
-                new_async_ops: self
-                    .async_ops
-                    .all()
-                    .map(|(_, value)| value.to_proto())
-                    .collect(),
-                stats_update: self.async_op_stats.as_proto(Include::All),
-            }),
-            now: Some(now.into()),
-            new_metadata: Some(proto::RegisterMetadata {
-                metadata: (*self.all_metadata).clone(),
-            }),
+        let now = Instant::now();
+
+        let update = loop {
+            let update = proto::instrument::Update {
+                task_update: Some(self.task_update(Include::All)),
+                resource_update: Some(self.resource_update(Include::All)),
+                async_op_update: Some(self.async_op_update(Include::All)),
+                now: Some(self.base_time.to_timestamp(now)),
+                new_metadata: Some(proto::RegisterMetadata {
+                    metadata: (*self.all_metadata).clone(),
+                }),
+            };
+            let message_size = update.encoded_len();
+            if message_size < MAX_MESSAGE_SIZE {
+                // normal case
+                break Some(update);
+            }
+            // If the grpc message is bigger than tokio-console will accept, throw away the oldest
+            // inactive data and try again
+            self.retention /= 2;
+            self.cleanup_closed();
+            tracing::debug!(
+                retention = ?self.retention,
+                message_size,
+                max_message_size = MAX_MESSAGE_SIZE,
+                "Message too big, reduced retention",
+            );
+
+            if self.retention <= self.publish_interval {
+                self.retention = self.publish_interval;
+                break None;
+            }
         };
 
-        if subscription.update(update) {
-            self.watchers.push(subscription)
+        match update {
+            // Send the initial state
+            Some(update) => {
+                if !subscription.update(&update) {
+                    // If sending the initial update fails, the subscription is already dead,
+                    // so don't add it to `watchers`.
+                    return;
+                }
+            }
+            // User will only get updates.
+            None => tracing::error!(
+                min_retention = ?self.publish_interval,
+                "Message too big. Start with smaller retention.",
+            ),
+        }
+
+        self.watchers.push(subscription);
+    }
+
+    fn task_update(&mut self, include: Include) -> proto::tasks::TaskUpdate {
+        proto::tasks::TaskUpdate {
+            new_tasks: self.tasks.as_proto_list(include, &self.base_time),
+            stats_update: self.task_stats.as_proto(include, &self.base_time),
+            dropped_events: self.shared.dropped_tasks.swap(0, AcqRel) as u64,
+        }
+    }
+
+    fn resource_update(&mut self, include: Include) -> proto::resources::ResourceUpdate {
+        proto::resources::ResourceUpdate {
+            new_resources: self.resources.as_proto_list(include, &self.base_time),
+            stats_update: self.resource_stats.as_proto(include, &self.base_time),
+            new_poll_ops: std::mem::take(&mut self.poll_ops),
+            dropped_events: self.shared.dropped_resources.swap(0, AcqRel) as u64,
+        }
+    }
+
+    fn async_op_update(&mut self, include: Include) -> proto::async_ops::AsyncOpUpdate {
+        proto::async_ops::AsyncOpUpdate {
+            new_async_ops: self.async_ops.as_proto_list(include, &self.base_time),
+            stats_update: self.async_op_stats.as_proto(include, &self.base_time),
+            dropped_events: self.shared.dropped_async_ops.swap(0, AcqRel) as u64,
         }
     }
 
@@ -483,23 +380,38 @@ impl Aggregator {
         if let Some(stats) = self.task_stats.get(&id) {
             let (tx, rx) = mpsc::channel(buffer);
             let subscription = Watch(tx);
-            let now = SystemTime::now();
+            let now = Some(self.base_time.to_timestamp(Instant::now()));
             // Send back the stream receiver.
             // Then send the initial state --- if this fails, the subscription is already dead.
             if stream_sender.send(rx).is_ok()
                 && subscription.update(&proto::tasks::TaskDetails {
-                    task_id: Some(id.into()),
-                    now: Some(now.into()),
-                    poll_times_histogram: serialize_histogram(&stats.poll_times_histogram).ok(),
+                    task_id: Some(id.clone().into()),
+                    now,
+                    poll_times_histogram: Some(stats.poll_duration_histogram()),
+                    scheduled_times_histogram: Some(stats.scheduled_duration_histogram()),
                 })
             {
                 self.details_watchers
-                    .entry(id)
-                    .or_insert_with(Vec::new)
+                    .entry(id.clone())
+                    .or_default()
                     .push(subscription);
             }
         }
         // If the task is not found, drop `stream_sender` which will result in a not found error
+    }
+
+    /// Add a state subscription to the watchers.
+    fn add_state_subscription(&mut self, subscription: Watch<proto::instrument::State>) {
+        self.state_watchers.push(subscription);
+    }
+
+    /// Publish the current state to all active state watchers.
+    fn publish_state(&mut self) {
+        let state = proto::instrument::State {
+            temporality: self.temporality.into(),
+        };
+        self.state_watchers
+            .retain_and_shrink(|watch| watch.update(&state));
     }
 
     /// Publish the current state to all active watchers.
@@ -514,38 +426,16 @@ impl Aggregator {
         } else {
             None
         };
+        let task_update = Some(self.task_update(Include::UpdatedOnly));
+        let resource_update = Some(self.resource_update(Include::UpdatedOnly));
+        let async_op_update = Some(self.async_op_update(Include::UpdatedOnly));
 
-        let new_poll_ops = std::mem::take(&mut self.new_poll_ops);
-
-        let now = SystemTime::now();
         let update = proto::instrument::Update {
-            now: Some(now.into()),
+            now: Some(self.base_time.to_timestamp(Instant::now())),
             new_metadata,
-            task_update: Some(proto::tasks::TaskUpdate {
-                new_tasks: self
-                    .tasks
-                    .since_last_update()
-                    .map(|(_, value)| value.to_proto())
-                    .collect(),
-                stats_update: self.task_stats.as_proto(Include::UpdatedOnly),
-            }),
-            resource_update: Some(proto::resources::ResourceUpdate {
-                new_resources: self
-                    .resources
-                    .since_last_update()
-                    .map(|(_, value)| value.to_proto())
-                    .collect(),
-                stats_update: self.resource_stats.as_proto(Include::UpdatedOnly),
-                new_poll_ops,
-            }),
-            async_op_update: Some(proto::async_ops::AsyncOpUpdate {
-                new_async_ops: self
-                    .async_ops
-                    .since_last_update()
-                    .map(|(_, value)| value.to_proto())
-                    .collect(),
-                stats_update: self.async_op_stats.as_proto(Include::UpdatedOnly),
-            }),
+            task_update,
+            resource_update,
+            async_op_update,
         };
 
         self.watchers
@@ -554,13 +444,13 @@ impl Aggregator {
         let stats = &self.task_stats;
         // Assuming there are much fewer task details subscribers than there are
         // stats updates, iterate over `details_watchers` and compact the map.
-        self.details_watchers.retain_and_shrink(|&id, watchers| {
-            if let Some(task_stats) = stats.get(&id) {
+        self.details_watchers.retain_and_shrink(|id, watchers| {
+            if let Some(task_stats) = stats.get(id) {
                 let details = proto::tasks::TaskDetails {
-                    task_id: Some(id.into()),
-                    now: Some(now.into()),
-                    poll_times_histogram: serialize_histogram(&task_stats.poll_times_histogram)
-                        .ok(),
+                    task_id: Some(id.clone().into()),
+                    now: Some(self.base_time.to_timestamp(Instant::now())),
+                    poll_times_histogram: Some(task_stats.poll_duration_histogram()),
+                    scheduled_times_histogram: Some(task_stats.scheduled_duration_histogram()),
                 };
                 watchers.retain(|watch| watch.update(&details));
                 !watchers.is_empty()
@@ -582,15 +472,15 @@ impl Aggregator {
             Event::Spawn {
                 id,
                 metadata,
-                at,
+                stats,
                 fields,
                 location,
             } => {
-                let id = self.ids.id_for(id);
                 self.tasks.insert(
-                    id,
+                    id.clone(),
                     Task {
-                        id,
+                        id: id.clone(),
+                        is_dirty: AtomicBool::new(true),
                         metadata,
                         fields,
                         location,
@@ -598,152 +488,48 @@ impl Aggregator {
                     },
                 );
 
-                self.task_stats.insert(
-                    id,
-                    TaskStats {
-                        created_at: Some(at),
-                        ..Default::default()
-                    },
-                );
-            }
-
-            Event::Enter { id, at } => {
-                let id = self.ids.id_for(id);
-                if let Some(mut task_stats) = self.task_stats.update(&id) {
-                    task_stats.poll_stats.update_on_span_enter(at);
-                }
-
-                if let Some(mut async_op_stats) = self.async_op_stats.update(&id) {
-                    async_op_stats.poll_stats.update_on_span_enter(at);
-                }
-            }
-
-            Event::Exit { id, at } => {
-                let id = self.ids.id_for(id);
-                if let Some(mut task_stats) = self.task_stats.update(&id) {
-                    task_stats.poll_stats.update_on_span_exit(at);
-                    if let Some(since_last_poll) = task_stats.poll_stats.since_last_poll(at) {
-                        task_stats
-                            .poll_times_histogram
-                            .record(since_last_poll.as_nanos().try_into().unwrap_or(u64::MAX))
-                            .unwrap();
-                    }
-                }
-
-                if let Some(mut async_op_stats) = self.async_op_stats.update(&id) {
-                    async_op_stats.poll_stats.update_on_span_exit(at);
-                }
-            }
-
-            Event::Close { id, at } => {
-                let id = self.ids.id_for(id);
-                if let Some(mut task_stats) = self.task_stats.update(&id) {
-                    task_stats.dropped_at = Some(at);
-                }
-
-                if let Some(mut resource_stats) = self.resource_stats.update(&id) {
-                    resource_stats.dropped_at = Some(at);
-                }
-
-                if let Some(mut async_op_stats) = self.async_op_stats.update(&id) {
-                    async_op_stats.dropped_at = Some(at);
-                }
-            }
-
-            Event::Waker { id, op, at } => {
-                let id = self.ids.id_for(id);
-                // It's possible for wakers to exist long after a task has
-                // finished. We don't want those cases to create a "new"
-                // task that isn't closed, just to insert some waker stats.
-                //
-                // It may be useful to eventually be able to report about
-                // "wasted" waker ops, but we'll leave that for another time.
-                if let Some(mut task_stats) = self.task_stats.update(&id) {
-                    match op {
-                        WakeOp::Wake { self_wake } | WakeOp::WakeByRef { self_wake } => {
-                            task_stats.wakes += 1;
-                            task_stats.last_wake = Some(at);
-
-                            // If the  task has woken itself, increment the
-                            // self-wake count.
-                            if self_wake {
-                                task_stats.self_wakes += 1;
-                            }
-
-                            // Note: `Waker::wake` does *not* call the `drop`
-                            // implementation, so waking by value doesn't
-                            // trigger a drop event. so, count this as a `drop`
-                            // to ensure the task's number of wakers can be
-                            // calculated as `clones` - `drops`.
-                            //
-                            // see
-                            // https://github.com/rust-lang/rust/blob/673d0db5e393e9c64897005b470bfeb6d5aec61b/library/core/src/task/wake.rs#L211-L212
-                            if let WakeOp::Wake { .. } = op {
-                                task_stats.waker_drops += 1;
-                            }
-                        }
-                        WakeOp::Clone => {
-                            task_stats.waker_clones += 1;
-                        }
-                        WakeOp::Drop => {
-                            task_stats.waker_drops += 1;
-                        }
-                    }
-                }
+                self.task_stats.insert(id, stats);
             }
 
             Event::Resource {
-                at,
                 id,
+                parent_id,
                 metadata,
                 kind,
                 concrete_type,
                 location,
-                ..
+                is_internal,
+                stats,
             } => {
-                let id = self.ids.id_for(id);
                 self.resources.insert(
-                    id,
+                    id.clone(),
                     Resource {
-                        id,
+                        id: id.clone(),
+                        is_dirty: AtomicBool::new(true),
+                        parent_id,
                         kind,
                         metadata,
                         concrete_type,
                         location,
+                        is_internal,
                     },
                 );
 
-                self.resource_stats.insert(
-                    id,
-                    ResourceStats {
-                        created_at: Some(at),
-                        ..Default::default()
-                    },
-                );
+                self.resource_stats.insert(id, stats);
             }
 
             Event::PollOp {
                 metadata,
-                at,
                 resource_id,
                 op_name,
                 async_op_id,
                 task_id,
                 is_ready,
             } => {
-                let async_op_id = self.ids.id_for(async_op_id);
-                let resource_id = self.ids.id_for(resource_id);
-                let task_id = self.ids.id_for(task_id);
-
-                let mut async_op_stats = self.async_op_stats.update_or_default(async_op_id);
-                async_op_stats.poll_stats.polls += 1;
-                async_op_stats.task_id.get_or_insert(task_id);
-                async_op_stats.resource_id.get_or_insert(resource_id);
-
-                if !is_ready && async_op_stats.poll_stats.first_poll.is_none() {
-                    async_op_stats.poll_stats.first_poll = Some(at);
+                // CLI doesn't show historical poll ops, so don't save them if no-one is watching
+                if self.watchers.is_empty() {
+                    return;
                 }
-
                 let poll_op = proto::resources::PollOp {
                     metadata: Some(metadata.into()),
                     resource_id: Some(resource_id.into()),
@@ -753,66 +539,79 @@ impl Aggregator {
                     is_ready,
                 };
 
-                self.all_poll_ops.push(poll_op.clone());
-                self.new_poll_ops.push(poll_op);
-            }
-
-            Event::StateUpdate {
-                resource_id,
-                update,
-                ..
-            } => {
-                let resource_id = self.ids.id_for(resource_id);
-                if let Some(mut stats) = self.resource_stats.update(&resource_id) {
-                    let field_name = match update.field.name.clone() {
-                        Some(name) => name,
-                        None => {
-                            tracing::warn!(?update.field, "field missing name, skipping...");
-                            return;
-                        }
-                    };
-
-                    let upd_key = FieldKey {
-                        resource_id,
-                        field_name,
-                    };
-                    match stats.attributes.entry(upd_key) {
-                        Entry::Occupied(ref mut attr) => {
-                            update_attribute(attr.get_mut(), update);
-                        }
-                        Entry::Vacant(attr) => {
-                            attr.insert(update.into());
-                        }
-                    }
-                }
+                self.poll_ops.push(poll_op);
             }
 
             Event::AsyncResourceOp {
-                at,
                 id,
                 source,
+                resource_id,
                 metadata,
-                ..
+                parent_id,
+                stats,
             } => {
-                let id = self.ids.id_for(id);
                 self.async_ops.insert(
-                    id,
+                    id.clone(),
                     AsyncOp {
-                        id,
+                        id: id.clone(),
+                        is_dirty: AtomicBool::new(true),
+                        resource_id,
                         metadata,
                         source,
+                        parent_id,
                     },
                 );
 
-                self.async_op_stats.insert(
-                    id,
-                    AsyncOpStats {
-                        created_at: Some(at),
-                        ..Default::default()
-                    },
-                );
+                self.async_op_stats.insert(id, stats);
             }
         }
+    }
+}
+
+fn recv_now_or_never<T>(receiver: &mut mpsc::Receiver<T>) -> Option<Option<T>> {
+    let waker = futures_task::noop_waker();
+    let mut cx = std::task::Context::from_waker(&waker);
+
+    match receiver.poll_recv(&mut cx) {
+        std::task::Poll::Ready(opt) => Some(opt),
+        std::task::Poll::Pending => None,
+    }
+}
+
+/// Count of events received in each aggregator drain cycle.
+struct EventCounts {
+    async_resource_op: usize,
+    metadata: usize,
+    poll_op: usize,
+    resource: usize,
+    spawn: usize,
+}
+
+impl EventCounts {
+    fn new() -> Self {
+        Self {
+            async_resource_op: 0,
+            metadata: 0,
+            poll_op: 0,
+            resource: 0,
+            spawn: 0,
+        }
+    }
+
+    /// Count the event based on its variant.
+    fn update(&mut self, event: &Event) {
+        match event {
+            Event::AsyncResourceOp { .. } => self.async_resource_op += 1,
+            Event::Metadata(_) => self.metadata += 1,
+            Event::PollOp { .. } => self.poll_op += 1,
+            Event::Resource { .. } => self.resource += 1,
+            Event::Spawn { .. } => self.spawn += 1,
+        }
+    }
+
+    /// Total number of events recorded.
+    fn total(&self) -> usize {
+        self.async_resource_op + self.metadata + self.poll_op + self.resource + self.spawn
     }
 }
 
@@ -850,26 +649,12 @@ impl<T: Clone> Watch<T> {
     }
 }
 
-impl ToProto for PollStats {
-    type Output = proto::PollStats;
-
-    fn to_proto(&self) -> Self::Output {
-        proto::PollStats {
-            polls: self.polls,
-            first_poll: self.first_poll.map(Into::into),
-            last_poll_started: self.last_poll_started.map(Into::into),
-            last_poll_ended: self.last_poll_ended.map(Into::into),
-            busy_time: Some(self.busy_time.into()),
-        }
-    }
-}
-
 impl ToProto for Task {
     type Output = proto::tasks::Task;
 
-    fn to_proto(&self) -> Self::Output {
+    fn to_proto(&self, _: &stats::TimeAnchor) -> Self::Output {
         proto::tasks::Task {
-            id: Some(self.id.into()),
+            id: Some(self.id.clone().into()),
             // TODO: more kinds of tasks...
             kind: proto::tasks::task::Kind::Spawn as i32,
             metadata: Some(self.metadata.into()),
@@ -880,158 +665,62 @@ impl ToProto for Task {
     }
 }
 
-impl ToProto for TaskStats {
-    type Output = proto::tasks::Stats;
+impl Unsent for Task {
+    fn take_unsent(&self) -> bool {
+        self.is_dirty.swap(false, AcqRel)
+    }
 
-    fn to_proto(&self) -> Self::Output {
-        proto::tasks::Stats {
-            poll_stats: Some(self.poll_stats.to_proto()),
-            created_at: self.created_at.map(Into::into),
-            dropped_at: self.dropped_at.map(Into::into),
-            wakes: self.wakes,
-            waker_clones: self.waker_clones,
-            self_wakes: self.self_wakes,
-            waker_drops: self.waker_drops,
-            last_wake: self.last_wake.map(Into::into),
-        }
+    fn is_unsent(&self) -> bool {
+        self.is_dirty.load(Acquire)
     }
 }
 
 impl ToProto for Resource {
     type Output = proto::resources::Resource;
 
-    fn to_proto(&self) -> Self::Output {
+    fn to_proto(&self, _: &stats::TimeAnchor) -> Self::Output {
         proto::resources::Resource {
-            id: Some(self.id.into()),
+            id: Some(self.id.clone().into()),
+            parent_resource_id: self.parent_id.clone().map(Into::into),
             kind: Some(self.kind.clone()),
             metadata: Some(self.metadata.into()),
             concrete_type: self.concrete_type.clone(),
             location: self.location.clone(),
+            is_internal: self.is_internal,
         }
     }
 }
 
-impl ToProto for ResourceStats {
-    type Output = proto::resources::Stats;
+impl Unsent for Resource {
+    fn take_unsent(&self) -> bool {
+        self.is_dirty.swap(false, AcqRel)
+    }
 
-    fn to_proto(&self) -> Self::Output {
-        let attributes = self.attributes.values().cloned().collect();
-        proto::resources::Stats {
-            created_at: self.created_at.map(Into::into),
-            dropped_at: self.dropped_at.map(Into::into),
-            attributes,
-        }
+    fn is_unsent(&self) -> bool {
+        self.is_dirty.load(Acquire)
     }
 }
 
 impl ToProto for AsyncOp {
     type Output = proto::async_ops::AsyncOp;
 
-    fn to_proto(&self) -> Self::Output {
+    fn to_proto(&self, _: &stats::TimeAnchor) -> Self::Output {
         proto::async_ops::AsyncOp {
-            id: Some(self.id.into()),
+            id: Some(self.id.clone().into()),
             metadata: Some(self.metadata.into()),
+            resource_id: Some(self.resource_id.clone().into()),
             source: self.source.clone(),
+            parent_async_op_id: self.parent_id.clone().map(Into::into),
         }
     }
 }
 
-impl ToProto for AsyncOpStats {
-    type Output = proto::async_ops::Stats;
-
-    fn to_proto(&self) -> Self::Output {
-        proto::async_ops::Stats {
-            poll_stats: Some(self.poll_stats.to_proto()),
-            created_at: self.created_at.map(Into::into),
-            dropped_at: self.dropped_at.map(Into::into),
-            resource_id: self.resource_id.map(Into::into),
-            task_id: self.task_id.map(Into::into),
-        }
-    }
-}
-
-impl From<AttributeUpdate> for Attribute {
-    fn from(upd: AttributeUpdate) -> Self {
-        Attribute {
-            field: Some(upd.field),
-            unit: upd.unit,
-        }
-    }
-}
-
-// === impl Ids ===
-
-impl Ids {
-    fn id_for(&mut self, span_id: span::Id) -> Id {
-        match self.id_mappings.entry(span_id) {
-            Entry::Occupied(entry) => *entry.get(),
-            Entry::Vacant(entry) => {
-                let task_id = self.next;
-                entry.insert(task_id);
-                self.next = self.next.wrapping_add(1);
-                task_id
-            }
-        }
+impl Unsent for AsyncOp {
+    fn take_unsent(&self) -> bool {
+        self.is_dirty.swap(false, AcqRel)
     }
 
-    #[inline]
-    fn remove_all(&mut self, ids: &HashSet<Id>) {
-        self.id_mappings.retain(|_, id| !ids.contains(id));
-    }
-}
-
-fn serialize_histogram(histogram: &Histogram<u64>) -> Result<Vec<u8>, V2SerializeError> {
-    let mut serializer = V2Serializer::new();
-    let mut buf = Vec::new();
-    serializer.serialize(histogram, &mut buf)?;
-    Ok(buf)
-}
-
-fn update_attribute(attribute: &mut Attribute, update: AttributeUpdate) {
-    use proto::field::Value::*;
-    let attribute_val = attribute.field.as_mut().and_then(|a| a.value.as_mut());
-    let update_val = update.field.value;
-    let update_name = update.field.name;
-
-    match (attribute_val, update_val) {
-        (Some(BoolVal(v)), Some(BoolVal(upd))) => *v = upd,
-
-        (Some(StrVal(v)), Some(StrVal(upd))) => *v = upd,
-
-        (Some(DebugVal(v)), Some(DebugVal(upd))) => *v = upd,
-
-        (Some(U64Val(v)), Some(U64Val(upd))) => match update.op {
-            Some(AttributeUpdateOp::Add) => *v += upd,
-
-            Some(AttributeUpdateOp::Sub) => *v -= upd,
-
-            Some(AttributeUpdateOp::Override) => *v = upd,
-
-            None => tracing::warn!(
-                "numeric attribute update {:?} needs to have an op field",
-                update_name
-            ),
-        },
-
-        (Some(I64Val(v)), Some(I64Val(upd))) => match update.op {
-            Some(AttributeUpdateOp::Add) => *v += upd,
-
-            Some(AttributeUpdateOp::Sub) => *v -= upd,
-
-            Some(AttributeUpdateOp::Override) => *v = upd,
-
-            None => tracing::warn!(
-                "numeric attribute update {:?} needs to have an op field",
-                update_name
-            ),
-        },
-
-        (val, update) => {
-            tracing::warn!(
-                "attribute {:?} cannot be updated by update {:?}",
-                val,
-                update
-            );
-        }
+    fn is_unsent(&self) -> bool {
+        self.is_dirty.load(Acquire)
     }
 }

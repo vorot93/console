@@ -1,1 +1,3 @@
-tonic::include_proto!("rs.tokio.console.trace");
+#![allow(warnings)]
+
+include!("generated/rs.tokio.console.trace.rs");

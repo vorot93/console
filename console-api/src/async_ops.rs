@@ -1,1 +1,3 @@
-tonic::include_proto!("rs.tokio.console.async_ops");
+#![allow(warnings)]
+
+include!("generated/rs.tokio.console.async_ops.rs");

@@ -1,0 +1,173 @@
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+name: CI
+
+env:
+  # Disable incremental compilation.
+  #
+  # Incremental compilation is useful as part of an edit-build-test-edit cycle,
+  # as it lets the compiler avoid recompiling code that hasn't changed. However,
+  # on CI, we're not making small edits; we're almost always building the entire
+  # project from scratch. Thus, incremental compilation on CI actually
+  # introduces *additional* overhead to support making future builds
+  # faster...but no future builds will ever occur in any given CI environment.
+  #
+  # See https://matklad.github.io/2021/09/04/fast-rust-builds.html#ci-workflow
+  # for details.
+  CARGO_INCREMENTAL: 0
+  # Allow more retries for network requests in cargo (downloading crates) and
+  # rustup (installing toolchains). This should help to reduce flaky CI failures
+  # from transient network timeouts or other issues.
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+  # Don't emit giant backtraces in the CI logs.
+  RUST_BACKTRACE: short
+  # Pin a nightly version for minimal versions
+  rust_nightly: nightly-2024-05-05
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run cargo check
+        run: cargo check
+
+  minimal-versions:
+    name: minimal-versions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust ${{ env.rust_nightly }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_nightly }}
+      - name: Install cargo-hack
+        uses: taiki-e/install-action@cargo-hack
+      - uses: Swatinem/rust-cache@v2
+      - name: "check -Z direct-minimal-versions"
+        run: |
+          # Remove dev-dependencies from Cargo.toml to prevent the next `cargo update`
+          # from determining minimal versions based on dev-dependencies.
+          cargo hack --remove-dev-deps --workspace
+          # Update Cargo.lock to minimal version dependencies.
+          cargo +${{ env.rust_nightly }} update -Z direct-minimal-versions
+          cargo check
+
+  test_os:
+    name: Tests on ${{ matrix.os }} with Rust ${{ matrix.rust }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        rust: [stable]
+        include:
+          - rust: 1.74.0
+            os: ubuntu-latest
+          # Try to build on the latest nightly. This job is allowed to fail, but
+          # it's useful to help catch bugs in upcoming Rust versions.
+          - rust: nightly
+            os: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install ${{ matrix.rust }} toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v2
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run cargo test (API)
+        run: cargo test -p console-api
+
+      - name: Run cargo test (subscriber)
+        run: cargo test -p console-subscriber
+
+      - name: Run cargo test (console)
+        run: cargo test -p tokio-console --locked
+
+  lints:
+    name: Lints
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: Run cargo clippy
+        run: cargo clippy --workspace --all-targets --no-deps -- -D warnings
+
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install ${{ matrix.rust }} toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run xtask check-docs-images
+        run: cargo run --bin xtask -- check-docs-images
+
+  grpc_web:
+    name: gRPC-web Example
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: console-subscriber/examples/grpc_web/app
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Format
+        run: npm run fmt
+
+      - name: Generate
+        run: npm run gen
+
+      - name: Check no changes
+        run: git diff --exit-code
+
+      - name: Build
+        run: npm run build
